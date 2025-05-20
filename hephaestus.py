@@ -9,6 +9,10 @@ from threading import Lock
 
 class Euclidean(object):
     @staticmethod
+    def name():
+        return "euclidean"
+    
+    @staticmethod
     @jax.jit
     def __call__(query, data):
         return jnp.linalg.norm(data - query, axis=1)
@@ -23,6 +27,10 @@ class Euclidean(object):
 
 
 class Angular(object):
+    @staticmethod
+    def name():
+        return "angular"
+
     @staticmethod
     @jax.jit
     def __call__(query, data):
@@ -101,12 +109,16 @@ class IVFEmpiricalHardness(object):
     def fit(self, data):
         self.data = data
         self.nlists = int(jnp.sqrt(data.shape[1]))
-        self.index = faiss.IndexIVFFlat(
-            faiss.IndexFlatL2(data.shape[1]),
-            data.shape[1],
-            self.nlists,
-            faiss.METRIC_L2,
-        )
+        if self.distance_fn.name() == "euclidean":
+            self.index = faiss.IndexIVFFlat(
+                faiss.IndexFlatL2(data.shape[1]),
+                data.shape[1],
+                self.nlists,
+                faiss.METRIC_L2,
+            )
+        else:
+            # TODO: support the angular case
+            raise ValueError("unsupported distance")
         self.query_params = list(range(1, self.nlists))
         self.index.train(data)
         self.index.add(data)
@@ -200,21 +212,23 @@ if __name__ == "__main__":
         data = jnp.array(hfp["train"][:])
         d = data.shape[1]
 
-    hg = HephaestusGradient(
-        Euclidean(), relative_contrast, learning_rate=1, max_iter=500, seed=1234
-    )
-    hg.fit(data)
+    fig, axs = plt.subplots(1, 3)
+
     k = 10
-    target = 1.05
-    q = hg.generate(k=k, rc_low=0.99 * target, rc_high=1.01 * target)
-    ic(relative_contrast(q, data, k, Euclidean()))
-    dists = jnp.sort(Euclidean()(q, data))
-    ic(dists[: 2 * k], dists.mean())
     empirical = IVFEmpiricalHardness(Euclidean(), 0.9)
     empirical.fit(data)
-    ic(empirical.evaluate(q, k))
-    plt.figure(figsize=(3, 3))
-    plt.imshow(q.reshape(28, 28))
-    plt.axis("off")
+
+    for target, ax in zip([4, 1.2, 1.05], axs):
+        hg = HephaestusGradient(
+            Euclidean(), relative_contrast, learning_rate=1, max_iter=500, seed=1234
+        )
+        hg.fit(data)
+        q = hg.generate(k=k, rc_low=0.99 * target, rc_high=1.01 * target)
+        rc = relative_contrast(q, data, k, Euclidean())
+        emp = empirical.evaluate(q, k)
+        ax.imshow(q.reshape(28, 28))
+        ax.set_title(f"RC={rc:.2f}\nempirical={emp:.2f}")
+        ax.axis("off")
+
     plt.tight_layout()
     plt.savefig("plot.png")
