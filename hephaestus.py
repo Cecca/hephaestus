@@ -3,6 +3,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
+import logging
+from threading import Lock
 
 
 class Euclidean(object):
@@ -35,34 +37,104 @@ class Angular(object):
     @staticmethod
     def fixup_gradient(grad, x):
         # project the gradients on the tangent plane
-        ic(grad.shape, x.shape)
-        grad = grad - ic(jnp.dot(grad, x)) * x
+        grad = grad - jnp.dot(grad, x) * x
         return grad / jnp.linalg.norm(grad)
-
-
-# @jax.jit
-# def euclidean(data, query):
-#     return jnp.linalg.norm(data - query, axis=1)
-
-
-# @jax.jit
-# def angular(data, query):
-#     return 1 - jnp.dot(data, query)
-
-
-# def k_smallest_dists(data, query, k, dist_fn):
-#     dists = dist_fn(data, query)
-#     idxs = jnp.argpartition(dists, k)
-#     return jnp.sort(dists[idxs[:k]])
 
 
 def relative_contrast(query, data, k, dist_fn):
     dists = dist_fn(query, data)
-    ic(dists.shape)
     idxs = jnp.argpartition(dists, k)
     kth = dists[idxs[k]]
     avg = jnp.mean(dists)
     return avg / kth
+
+
+def partition_by(candidates, fun):
+    # first do an exponential search
+    upper = 0
+    lower = 0
+    cur_res = None
+    while upper < len(candidates):
+        res = fun(candidates[upper])
+        if res is not None:
+            cur_res = res
+            break
+        lower = upper
+        upper = upper * 2 if upper > 0 else 1
+    upper = min(upper, len(candidates))
+
+    # now we know that the predicate is satisfied between prev_ids (where it
+    # is not satisfied) and cur_idx (where it is satisfied). So we do a binary search between the two
+    while lower < upper:
+        mid = (lower + upper) // 2
+        mid_res = fun(candidates[mid])
+        if mid_res is not None:
+            cur_res = mid_res
+            upper = mid
+        else:
+            lower = mid + 1
+
+    return cur_res
+
+
+def compute_recall(ground_distances, run_distances, count, epsilon=1e-3):
+    """
+    Compute the recall against the given ground truth, for `count`
+    number of neighbors.
+    """
+    t = ground_distances[count - 1] + epsilon
+    actual = 0
+    for d in run_distances[:count]:
+        if d <= t:
+            actual += 1
+    return float(actual) / float(count)
+
+
+EMPIRICAL_HARDNESS_LOCK = Lock()
+
+
+class IVFEmpiricalHardness(object):
+    def __init__(self, distance_fn, recall):
+        self.recall = recall
+        self.distance_fn = distance_fn
+
+    def fit(self, data):
+        self.data = data
+        self.nlists = int(jnp.sqrt(data.shape[1]))
+        self.index = faiss.IndexIVFFlat(
+            faiss.IndexFlatL2(data.shape[1]),
+            data.shape[1],
+            self.nlists,
+            faiss.METRIC_L2,
+        )
+        self.query_params = list(range(1, self.nlists))
+        self.index.train(data)
+        self.index.add(data)
+
+    def evaluate(self, query, k):
+        query = query.reshape(1, -1)
+        ground_truth = jnp.sort(self.distance_fn(query, self.data))
+
+        def tester(nprobe):
+            # we need to lock the execution because the statistics collection is
+            # not thread safe, in that it uses global variables.
+            with EMPIRICAL_HARDNESS_LOCK:
+                faiss.cvar.indexIVF_stats.reset()
+                self.index.nprobe = nprobe
+                run_dists = jnp.sqrt(self.index.search(query, k)[0][0])
+                distcomp = (
+                    faiss.cvar.indexIVF_stats.ndis
+                    + faiss.cvar.indexIVF_stats.nq * self.index.nlist
+                )
+
+            rec = compute_recall(ground_truth, run_dists, k)
+            if rec >= self.recall:
+                return distcomp / self.index.ntotal
+            else:
+                return None
+
+        dist_frac = partition_by(self.query_params, tester)
+        return dist_frac
 
 
 class HephaestusGradient(object):
@@ -87,15 +159,16 @@ class HephaestusGradient(object):
         optimizer = optax.adam(self.learning_rate)
         grad_fn = jax.value_and_grad(relative_contrast)
 
-        x = self.data[jax.random.randint(self.random_state, (1,), 0, self.data.shape[0])[0]]
-        x += jax.random.normal(self.random_state, (self.data.shape[1], )) * 0.001
+        x = self.data[
+            jax.random.randint(self.random_state, (1,), 0, self.data.shape[0])[0]
+        ]
+        x += jax.random.normal(self.random_state, (self.data.shape[1],)) * 0.001
         x = self.distance.fixup_point(x)
         opt_state = optimizer.init(x)
 
         for i in range(self.max_iter):
-            ic(i)
             rc, grads = grad_fn(x, self.data, k, self.distance)
-            ic(rc, grads.shape)
+            logging.info("iteration %d rc=%f", i, rc)
             assert jnp.isfinite(rc)
 
             if rc_low <= rc <= rc_high:
@@ -104,8 +177,9 @@ class HephaestusGradient(object):
             grads = self.distance.fixup_gradient(grads, x)
 
             if rc < rc_low:
+                # If we are too low, go the other way around
                 grads = -grads
-        
+
             updates, opt_state = optimizer.update(grads, opt_state)
             x = optax.apply_updates(x, updates)
             x = self.distance.fixup_point(x)
@@ -116,13 +190,31 @@ class HephaestusGradient(object):
 
 
 if __name__ == "__main__":
-    gen = np.random.default_rng(123)
-    d = 100
-    data = jnp.array(gen.normal(size=(100000, d)))
-    data /= jnp.linalg.norm(data, axis=1)[:,jnp.newaxis]
-    ic(data.shape)
+    import h5py
+    import matplotlib.pyplot as plt
+    import faiss
 
-    hg = HephaestusGradient(Euclidean(), relative_contrast, max_iter=100)
+    logging.basicConfig(level=logging.INFO)
+
+    with h5py.File("fashion-mnist-784-euclidean.hdf5") as hfp:
+        data = jnp.array(hfp["train"][:])
+        d = data.shape[1]
+
+    hg = HephaestusGradient(
+        Euclidean(), relative_contrast, learning_rate=1, max_iter=500, seed=1234
+    )
     hg.fit(data)
-    q = hg.generate(k=10, rc_low=1.1, rc_high=1.2)
-
+    k = 10
+    target = 1.05
+    q = hg.generate(k=k, rc_low=0.99 * target, rc_high=1.01 * target)
+    ic(relative_contrast(q, data, k, Euclidean()))
+    dists = jnp.sort(Euclidean()(q, data))
+    ic(dists[: 2 * k], dists.mean())
+    empirical = IVFEmpiricalHardness(Euclidean(), 0.9)
+    empirical.fit(data)
+    ic(empirical.evaluate(q, k))
+    plt.figure(figsize=(3, 3))
+    plt.imshow(q.reshape(28, 28))
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig("plot.png")

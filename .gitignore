@@ -9,3 +9,5 @@ wheels/
 # Virtual environments
 .venv
 .direnv
+plot.png
+fashion-mnist-784-euclidean.hdf5
