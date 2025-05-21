@@ -3,6 +3,7 @@ import logging
 import jax.numpy as jnp
 import h5py
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 
 
 logging.basicConfig(level=logging.INFO)
@@ -24,14 +25,27 @@ empirical_ivf.fit(data)
 empirical_hnsw = HNSWEmpiricalHardness(distance, 0.9)
 empirical_hnsw.fit(data)
 
-fig, axs = plt.subplots(2, len(targets), figsize=(6, 3))
+# fig, axs = plt.subplots(2, len(targets), figsize=(6, 3))
+fig = plt.figure(figsize=(6, 5), layout="constrained")
+gs = GridSpec(
+    k // 2 + 2, 2 * len(targets), figure=fig, height_ratios=[1.5] * 2 + [1] * 5
+)
 
 # generate three queries with different target Relative Constrast
 # values. The first is expected to be easier than the last
 for i, target in enumerate(targets):
     # set up the generator
     hg = HephaestusGradient(
-        distance, relative_contrast, learning_rate=1, max_iter=500, seed=1234
+        # distance metric to use
+        distance,
+        # the function used to score candidate queries
+        relative_contrast,
+        learning_rate=1,
+        # how many iterations to run at most. Returns the best
+        # candidate query found so far, if the budget is exhausted
+        max_iter=500,
+        # the seed makes the execution deterministic
+        seed=1234,
     )
     # pass the data to the generator
     hg.fit(data)
@@ -45,18 +59,19 @@ for i, target in enumerate(targets):
     emp_hnsw = empirical_hnsw.evaluate(q, k) * 100
 
     # get the kth nearest neighbor
-    kth_index = jnp.argpartition(distance(q, data), k)[k]
-    neighbor = data[kth_index]
+    neighbors_idxs = jnp.argpartition(distance(q, data), k)[:k]
 
     # plot the query
-    axs[0, i].imshow(q.reshape(28, 28))
-    axs[0, i].set_title(f"RC={rc:.2f}\nLID={lid:.2f}\nempirical={emp_ivf:.1f}%")
-    axs[0, i].axis("off")
+    ax = fig.add_subplot(gs[0:2, 2 * i : 2 * i + 2])
+    ax.imshow(q.reshape(28, 28))
+    ax.set_title(f"RC={rc:.2f}\nLID={lid:.2f}\nempirical_ivf={emp_ivf:.1f}%\nempirical_hnsw={emp_hnsw:.1f}%")
+    ax.axis("off")
 
-    # plot the neighbor
-    axs[1, i].imshow(neighbor.reshape(28, 28))
-    axs[1, i].set_title("k-th neighbor")
-    axs[1, i].axis("off")
+    # plot the neighbors
+    for j, idx in enumerate(neighbors_idxs):
+        ax = fig.add_subplot(gs[2 + (j % (k // 2)), 2 * i + (j // (k // 2))])
+        ax.imshow(data[idx, :].reshape(28, 28), cmap="Greys")
+        ax.axis("off")
 
 plt.tight_layout()
 plt.savefig("imgs/queries-by-rc.png")
