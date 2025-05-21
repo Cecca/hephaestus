@@ -1,3 +1,4 @@
+import faiss
 from icecream import ic
 import numpy as np
 import jax
@@ -11,7 +12,7 @@ class Euclidean(object):
     @staticmethod
     def name():
         return "euclidean"
-    
+
     @staticmethod
     @jax.jit
     def __call__(query, data):
@@ -73,12 +74,12 @@ def local_intrinsic_dimensionality(query, data, k, dist_fn):
     valid = small.size + large.size
 
     return -valid / s
-    
+
 
 def query_expansion(query, data, k, dist_fn):
     dists = dist_fn(query, data)
     dists = jnp.sort(dists)
-    return ic(dists[2*k]) / ic(dists[k])
+    return ic(dists[2 * k]) / ic(dists[k])
 
 
 def partition_by(candidates, fun):
@@ -191,7 +192,7 @@ class HephaestusGradient(object):
     def fit(self, data):
         self.data = jnp.array(data)
 
-    def generate(self, k, rc_low, rc_high):
+    def generate(self, k, score_low, score_high):
         optimizer = optax.adam(self.learning_rate)
         grad_fn = jax.value_and_grad(relative_contrast)
 
@@ -203,16 +204,16 @@ class HephaestusGradient(object):
         opt_state = optimizer.init(x)
 
         for i in range(self.max_iter):
-            rc, grads = grad_fn(x, self.data, k, self.distance)
-            logging.info("iteration %d rc=%f", i, rc)
-            assert jnp.isfinite(rc)
+            score, grads = grad_fn(x, self.data, k, self.distance)
+            logging.info("iteration %d score=%f", i, score)
+            assert jnp.isfinite(score)
 
-            if rc_low <= rc <= rc_high:
+            if score_low <= score <= score_high:
                 break
 
             grads = self.distance.fixup_gradient(grads, x)
 
-            if rc < rc_low:
+            if score < score_low:
                 # If we are too low, go the other way around
                 grads = -grads
 
@@ -236,7 +237,7 @@ if __name__ == "__main__":
         data = jnp.array(hfp["train"][:])
         d = data.shape[1]
 
-    fig, axs = plt.subplots(1, 3, figsize=(6,3))
+    fig, axs = plt.subplots(1, 3, figsize=(6, 3))
 
     k = 10
     empirical = IVFEmpiricalHardness(Euclidean(), 0.9)
@@ -249,7 +250,7 @@ if __name__ == "__main__":
             distance, relative_contrast, learning_rate=1, max_iter=500, seed=1234
         )
         hg.fit(data)
-        q = hg.generate(k=k, rc_low=0.99 * target, rc_high=1.01 * target)
+        q = hg.generate(k=k, score_low=0.99 * target, score_high=1.01 * target)
         rc = relative_contrast(q, data, k, distance)
         lid = local_intrinsic_dimensionality(q, data, k, distance)
         emp = empirical.evaluate(q, k) * 100
