@@ -149,8 +149,8 @@ class IVFEmpiricalHardness(object):
         self.index.add(data)
 
     def evaluate(self, query, k):
-        query = query.reshape(1, -1)
         ground_truth = jnp.sort(self.distance_fn(query, self.data))
+        query = query.reshape(1, -1)
 
         def tester(nprobe):
             # we need to lock the execution because the statistics collection is
@@ -172,6 +172,57 @@ class IVFEmpiricalHardness(object):
 
         dist_frac = partition_by(self.query_params, tester)
         return dist_frac
+
+
+class HNSWEmpiricalHardness(object):
+    """
+    Stores (and possibly caches on a file) a FAISS-HNSW index to evaluate the difficulty
+    of queries, using the number of computed distances as a proxy for the difficulty.
+    """
+
+    def __init__(self, distance_fn, recall, index_params="HNSW32"):
+        self.index_params = index_params
+        self.recall = recall
+        self.distance_fn = distance_fn
+
+    def fit(self, data):
+        # TODO: handle the angular distance case
+        self.index = faiss.index_factory(data.shape[1], self.index_params)
+        self.index.train(data)
+        self.index.add(data)
+        self.data = data
+
+    def evaluate(self, query, k):
+        """Evaluates the empirical difficulty of the given point `x` for the given `k`.
+        Returns the number of distance computations, scaled by the number of datasets.
+        """
+        ground_truth = jnp.sort(self.distance_fn(query, self.data))
+        query = query.reshape(1, -1)
+
+        def tester(efsearch):
+            # we need to lock the execution because the statistics collection is
+            # not thread safe, in that it uses global variables.
+            with EMPIRICAL_HARDNESS_LOCK:
+                faiss.cvar.hnsw_stats.reset()
+                self.index.hnsw.efSearch = efsearch
+                run_dists = jnp.sqrt(self.index.search(query, k)[0][0])
+                stats = faiss.cvar.hnsw_stats
+                distcomp = stats.ndis
+
+            rec = compute_recall(ground_truth, run_dists, k)
+            if rec >= self.recall:
+                return distcomp / self.index.ntotal
+            else:
+                return None
+
+        dist_frac = partition_by(list(range(1, self.index.ntotal)), tester)
+
+        if dist_frac is not None:
+            return dist_frac
+        else:
+            raise Exception(
+                "Could not get the desired recall, even visiting the entire dataset"
+            )
 
 
 class HephaestusGradient(object):
@@ -240,8 +291,10 @@ if __name__ == "__main__":
     fig, axs = plt.subplots(1, 3, figsize=(6, 3))
 
     k = 10
-    empirical = IVFEmpiricalHardness(Euclidean(), 0.9)
-    empirical.fit(data)
+    empirical_ivf = IVFEmpiricalHardness(Euclidean(), 0.9)
+    empirical_ivf.fit(data)
+    empirical_hnsw = HNSWEmpiricalHardness(Euclidean(), 0.9)
+    empirical_hnsw.fit(data)
 
     distance = Euclidean()
 
@@ -253,9 +306,11 @@ if __name__ == "__main__":
         q = hg.generate(k=k, score_low=0.99 * target, score_high=1.01 * target)
         rc = relative_contrast(q, data, k, distance)
         lid = local_intrinsic_dimensionality(q, data, k, distance)
-        emp = empirical.evaluate(q, k) * 100
+        emp_ivf = empirical_ivf.evaluate(q, k) * 100
+        emp_hnsw = empirical_hnsw.evaluate(q, k) * 100
+        ic(emp_hnsw)
         ax.imshow(q.reshape(28, 28))
-        ax.set_title(f"RC={rc:.2f}\nLID={lid:.2f}\nempirical={emp:.1f}%")
+        ax.set_title(f"RC={rc:.2f}\nLID={lid:.2f}\nempirical_ivf={emp_ivf:.1f}\nempirical_hnsw={emp_hnsw:.1f}%")
         ax.axis("off")
 
     plt.tight_layout()
