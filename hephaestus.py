@@ -26,6 +26,10 @@ class Euclidean(object):
     def fixup_gradient(grad, _x):
         return grad
 
+    @staticmethod
+    def from_euclidean(dists):
+        return dists
+
 
 class Angular(object):
     @staticmethod
@@ -48,6 +52,10 @@ class Angular(object):
         # project the gradients on the tangent plane
         grad = grad - jnp.dot(grad, x) * x
         return grad / jnp.linalg.norm(grad)
+
+    @staticmethod
+    def from_euclidean(dists):
+        return 1 - (2 - dists**2) / 2
 
 
 def relative_contrast(query, data, k, dist_fn):
@@ -130,20 +138,21 @@ class IVFEmpiricalHardness(object):
     def __init__(self, distance_fn, recall):
         self.recall = recall
         self.distance_fn = distance_fn
+        self.assert_normalized = self.distance_fn.name() == "angular"
 
     def fit(self, data):
+        if self.assert_normalized:
+            assert jnp.allclose(
+                1.0, jnp.linalg.norm(data, axis=1)
+            ), "Data points should have unit norm"
         self.data = data
         self.nlists = int(jnp.sqrt(data.shape[1]))
-        if self.distance_fn.name() == "euclidean":
-            self.index = faiss.IndexIVFFlat(
-                faiss.IndexFlatL2(data.shape[1]),
-                data.shape[1],
-                self.nlists,
-                faiss.METRIC_L2,
-            )
-        else:
-            # TODO: support the angular case
-            raise ValueError("unsupported distance")
+        self.index = faiss.IndexIVFFlat(
+            faiss.IndexFlatL2(data.shape[1]),
+            data.shape[1],
+            self.nlists,
+            faiss.METRIC_L2,
+        )
         self.query_params = list(range(1, self.nlists))
         self.index.train(data)
         self.index.add(data)
@@ -151,6 +160,10 @@ class IVFEmpiricalHardness(object):
     def evaluate(self, query, k):
         ground_truth = jnp.sort(self.distance_fn(query, self.data))
         query = query.reshape(1, -1)
+        if self.assert_normalized:
+            assert jnp.allclose(
+                1.0, jnp.linalg.norm(query, axis=1)
+            ), "Data points should have unit norm"
 
         def tester(nprobe):
             # we need to lock the execution because the statistics collection is
@@ -158,7 +171,7 @@ class IVFEmpiricalHardness(object):
             with EMPIRICAL_HARDNESS_LOCK:
                 faiss.cvar.indexIVF_stats.reset()
                 self.index.nprobe = nprobe
-                run_dists = jnp.sqrt(self.index.search(query, k)[0][0])
+                run_dists = self.distance_fn.from_euclidean(jnp.sqrt(self.index.search(query, k)[0][0]))
                 distcomp = (
                     faiss.cvar.indexIVF_stats.ndis
                     + faiss.cvar.indexIVF_stats.nq * self.index.nlist
@@ -184,9 +197,13 @@ class HNSWEmpiricalHardness(object):
         self.index_params = index_params
         self.recall = recall
         self.distance_fn = distance_fn
+        self.assert_normalized = self.distance_fn.name() == "angular"
 
     def fit(self, data):
-        # TODO: handle the angular distance case
+        if self.assert_normalized:
+            assert jnp.allclose(
+                1.0, jnp.linalg.norm(data, axis=1)
+            ), "Data points should have unit norm"
         self.index = faiss.index_factory(data.shape[1], self.index_params)
         self.index.train(data)
         self.index.add(data)
@@ -198,6 +215,10 @@ class HNSWEmpiricalHardness(object):
         """
         ground_truth = jnp.sort(self.distance_fn(query, self.data))
         query = query.reshape(1, -1)
+        if self.assert_normalized:
+            assert jnp.allclose(
+                1.0, jnp.linalg.norm(query, axis=1)
+            ), "Data points should have unit norm"
 
         def tester(efsearch):
             # we need to lock the execution because the statistics collection is
@@ -205,7 +226,7 @@ class HNSWEmpiricalHardness(object):
             with EMPIRICAL_HARDNESS_LOCK:
                 faiss.cvar.hnsw_stats.reset()
                 self.index.hnsw.efSearch = efsearch
-                run_dists = jnp.sqrt(self.index.search(query, k)[0][0])
+                run_dists = self.distance_fn.from_euclidean(jnp.sqrt(self.index.search(query, k)[0][0]))
                 stats = faiss.cvar.hnsw_stats
                 distcomp = stats.ndis
 
@@ -287,18 +308,20 @@ if __name__ == "__main__":
     with h5py.File("fashion-mnist-784-euclidean.hdf5") as hfp:
         data = jnp.array(hfp["train"][:])
         d = data.shape[1]
+    data /= jnp.linalg.norm(data, axis=1)[:,jnp.newaxis]
 
     fig, axs = plt.subplots(1, 3, figsize=(6, 3))
 
     k = 10
-    empirical_ivf = IVFEmpiricalHardness(Euclidean(), 0.9)
-    empirical_ivf.fit(data)
-    empirical_hnsw = HNSWEmpiricalHardness(Euclidean(), 0.9)
-    empirical_hnsw.fit(data)
-
     distance = Euclidean()
 
-    for target, ax in zip([4, 1.2, 1.05], axs):
+    empirical_ivf = IVFEmpiricalHardness(distance, 0.9)
+    empirical_ivf.fit(data)
+    empirical_hnsw = HNSWEmpiricalHardness(distance, 0.9)
+    empirical_hnsw.fit(data)
+
+
+    for target, ax in zip([4], axs):
         hg = HephaestusGradient(
             distance, relative_contrast, learning_rate=1, max_iter=500, seed=1234
         )
