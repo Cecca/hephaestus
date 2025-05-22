@@ -11,3 +11,4 @@ wheels/
 .direnv
 plot.png
 fashion-mnist-784-euclidean.hdf5
+fashion-mnist-784-euclidean-queries.hdf5

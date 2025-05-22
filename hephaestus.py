@@ -87,7 +87,7 @@ def local_intrinsic_dimensionality(query, data, k, dist_fn):
 def query_expansion(query, data, k, dist_fn):
     dists = dist_fn(query, data)
     dists = jnp.sort(dists)
-    return ic(dists[2 * k]) / ic(dists[k])
+    return dists[2 * k] / dists[k]
 
 
 def partition_by(candidates, fun):
@@ -264,6 +264,19 @@ class HephaestusGradient(object):
     def fit(self, data):
         self.data = jnp.array(data)
 
+    def generate_many(self, k, scores):
+        from joblib import Parallel, delayed
+        def fn(score_pair):
+            q = self.generate(k, score_pair[0], score_pair[1])
+            rc = relative_contrast(q, self.data, k, self.distance)
+            dists = self.distance(q, self.data)
+            idxs = jnp.argsort(dists)
+            return q, rc, idxs[:k], dists[idxs[:k]]
+            
+        res = Parallel(n_jobs=-1)(delayed(fn)(score_pair) for score_pair in scores)
+        queries, rcs, idxs, dists = zip(*res)
+        return jnp.stack(queries), jnp.array(rcs), jnp.stack(idxs), jnp.stack(dists)
+
     def generate(self, k, score_low, score_high):
         optimizer = optax.adam(self.learning_rate)
         grad_fn = jax.value_and_grad(relative_contrast)
@@ -300,41 +313,85 @@ class HephaestusGradient(object):
 
 if __name__ == "__main__":
     import h5py
-    import matplotlib.pyplot as plt
-    import faiss
+    import argparse
+    import pathlib
 
-    logging.basicConfig(level=logging.INFO)
+    parser = argparse.ArgumentParser("hephaestus")
+    parser.add_argument("-d", "--dataset", type=pathlib.Path, required=True)
+    parser.add_argument("-k", type=int, required=True)
+    parser.add_argument("--distance", type=str, required=False)
+    parser.add_argument("--delta", type=float, default=0.01)
+    parser.add_argument("-o", "--output", type=pathlib.Path, required=False)
+    parser.add_argument('--verbose', '-v', action='count', default=0)
+    parser.add_argument("-q", "--queries", action="extend", nargs="+", type=str)
+    parser.add_argument("--learning-rate", type=float, default=1)
+    parser.add_argument("--max-iter", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=1234)
 
-    with h5py.File("fashion-mnist-784-euclidean.hdf5") as hfp:
+    args = parser.parse_args()
+    if args.verbose == 1:
+        logging.basicConfig(level=logging.INFO)
+    elif args.verbose >= 2:
+        logging.basicConfig(level=logging.DEBUG)
+
+    k = args.k
+
+    path = args.dataset
+    if not path.is_file():
+        raise ValueError("dataset file does not exist!")
+    if args.output is None:
+        output = path.with_name(path.stem + "-queries" + path.suffix)
+    else:
+        output = args.output
+    if output.is_file():
+        raise ValueError("output file already exists!")
+
+    if args.distance is None:
+        if path.match("*euclidean*"):
+            distance = Euclidean()
+        elif path.match("*angular*"):
+            distance = Angular()
+        else:
+            raise ValueError("distance not given, and cannot be inferred from name")
+        logging.warning("distance not given, inferred from file name: %s", distance.name())
+    elif args.distance == "euclidean":
+        distance = Euclidean()
+    elif args.distance == "angular":
+        distance = Angular()
+    else:
+        raise ValueError("unsupported distance function: " + args.distance)
+
+    scores = []
+    delta = args.delta
+    for spec in args.queries:
+        n, rc = spec.split(":")
+        n = int(n)
+        rc = float(rc)
+        scores.extend([(rc/(1+delta), rc*(1+delta))] * n)
+
+    hephaestus = HephaestusGradient(
+        distance,
+        relative_contrast,
+        args.learning_rate,
+        args.max_iter,
+        args.seed
+    )
+    with h5py.File(path) as hfp:
         data = jnp.array(hfp["train"][:])
-        d = data.shape[1]
-    data /= jnp.linalg.norm(data, axis=1)[:,jnp.newaxis]
+    hephaestus.fit(data)
 
-    fig, axs = plt.subplots(1, 3, figsize=(6, 3))
+    queries, rcs, idxs, dists = hephaestus.generate_many(k, scores)
 
-    k = 10
-    distance = Euclidean()
+    with h5py.File(output, "w") as hfp:
+        for key, value in vars(args).items():
+            try:
+                hfp.attrs[key] = value
+            except TypeError:
+                hfp.attrs[key] = str(value)
+        hfp["test"] = queries
+        hfp["relative_contrasts"] = rcs
+        hfp["neighbors"] = idxs
+        hfp["distances"] = dists
 
-    empirical_ivf = IVFEmpiricalHardness(distance, 0.9)
-    empirical_ivf.fit(data)
-    empirical_hnsw = HNSWEmpiricalHardness(distance, 0.9)
-    empirical_hnsw.fit(data)
+    
 
-
-    for target, ax in zip([4], axs):
-        hg = HephaestusGradient(
-            distance, relative_contrast, learning_rate=1, max_iter=500, seed=1234
-        )
-        hg.fit(data)
-        q = hg.generate(k=k, score_low=0.99 * target, score_high=1.01 * target)
-        rc = relative_contrast(q, data, k, distance)
-        lid = local_intrinsic_dimensionality(q, data, k, distance)
-        emp_ivf = empirical_ivf.evaluate(q, k) * 100
-        emp_hnsw = empirical_hnsw.evaluate(q, k) * 100
-        ic(emp_hnsw)
-        ax.imshow(q.reshape(28, 28))
-        ax.set_title(f"RC={rc:.2f}\nLID={lid:.2f}\nempirical_ivf={emp_ivf:.1f}\nempirical_hnsw={emp_hnsw:.1f}%")
-        ax.axis("off")
-
-    plt.tight_layout()
-    plt.savefig("plot.png")
