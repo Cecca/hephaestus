@@ -18,3 +18,10 @@ dependencies = [
     "sympy>=1.14.0",
 ]
 
+
+[project.scripts]
+hephaestus = "hephaestus:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

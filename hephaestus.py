@@ -142,9 +142,9 @@ class IVFEmpiricalHardness(object):
 
     def fit(self, data):
         if self.assert_normalized:
-            assert jnp.allclose(
-                1.0, jnp.linalg.norm(data, axis=1)
-            ), "Data points should have unit norm"
+            assert jnp.allclose(1.0, jnp.linalg.norm(data, axis=1)), (
+                "Data points should have unit norm"
+            )
         self.data = data
         self.nlists = int(jnp.sqrt(data.shape[1]))
         self.index = faiss.IndexIVFFlat(
@@ -161,9 +161,9 @@ class IVFEmpiricalHardness(object):
         ground_truth = jnp.sort(self.distance_fn(query, self.data))
         query = query.reshape(1, -1)
         if self.assert_normalized:
-            assert jnp.allclose(
-                1.0, jnp.linalg.norm(query, axis=1)
-            ), "Data points should have unit norm"
+            assert jnp.allclose(1.0, jnp.linalg.norm(query, axis=1)), (
+                "Data points should have unit norm"
+            )
 
         def tester(nprobe):
             # we need to lock the execution because the statistics collection is
@@ -171,7 +171,9 @@ class IVFEmpiricalHardness(object):
             with EMPIRICAL_HARDNESS_LOCK:
                 faiss.cvar.indexIVF_stats.reset()
                 self.index.nprobe = nprobe
-                run_dists = self.distance_fn.from_euclidean(jnp.sqrt(self.index.search(query, k)[0][0]))
+                run_dists = self.distance_fn.from_euclidean(
+                    jnp.sqrt(self.index.search(query, k)[0][0])
+                )
                 distcomp = (
                     faiss.cvar.indexIVF_stats.ndis
                     + faiss.cvar.indexIVF_stats.nq * self.index.nlist
@@ -201,9 +203,9 @@ class HNSWEmpiricalHardness(object):
 
     def fit(self, data):
         if self.assert_normalized:
-            assert jnp.allclose(
-                1.0, jnp.linalg.norm(data, axis=1)
-            ), "Data points should have unit norm"
+            assert jnp.allclose(1.0, jnp.linalg.norm(data, axis=1)), (
+                "Data points should have unit norm"
+            )
         self.index = faiss.index_factory(data.shape[1], self.index_params)
         self.index.train(data)
         self.index.add(data)
@@ -216,9 +218,9 @@ class HNSWEmpiricalHardness(object):
         ground_truth = jnp.sort(self.distance_fn(query, self.data))
         query = query.reshape(1, -1)
         if self.assert_normalized:
-            assert jnp.allclose(
-                1.0, jnp.linalg.norm(query, axis=1)
-            ), "Data points should have unit norm"
+            assert jnp.allclose(1.0, jnp.linalg.norm(query, axis=1)), (
+                "Data points should have unit norm"
+            )
 
         def tester(efsearch):
             # we need to lock the execution because the statistics collection is
@@ -226,7 +228,9 @@ class HNSWEmpiricalHardness(object):
             with EMPIRICAL_HARDNESS_LOCK:
                 faiss.cvar.hnsw_stats.reset()
                 self.index.hnsw.efSearch = efsearch
-                run_dists = self.distance_fn.from_euclidean(jnp.sqrt(self.index.search(query, k)[0][0]))
+                run_dists = self.distance_fn.from_euclidean(
+                    jnp.sqrt(self.index.search(query, k)[0][0])
+                )
                 stats = faiss.cvar.hnsw_stats
                 distcomp = stats.ndis
 
@@ -266,13 +270,14 @@ class HephaestusGradient(object):
 
     def generate_many(self, k, scores):
         from joblib import Parallel, delayed
+
         def fn(score_pair):
             q = self.generate(k, score_pair[0], score_pair[1])
             rc = relative_contrast(q, self.data, k, self.distance)
             dists = self.distance(q, self.data)
             idxs = jnp.argsort(dists)
             return q, rc, idxs[:k], dists[idxs[:k]]
-            
+
         res = Parallel(n_jobs=-1)(delayed(fn)(score_pair) for score_pair in scores)
         queries, rcs, idxs, dists = zip(*res)
         return jnp.stack(queries), jnp.array(rcs), jnp.stack(idxs), jnp.stack(dists)
@@ -311,7 +316,7 @@ class HephaestusGradient(object):
         return x
 
 
-if __name__ == "__main__":
+def main():
     import h5py
     import argparse
     import pathlib
@@ -322,7 +327,7 @@ if __name__ == "__main__":
     parser.add_argument("--distance", type=str, required=False)
     parser.add_argument("--delta", type=float, default=0.01)
     parser.add_argument("-o", "--output", type=pathlib.Path, required=False)
-    parser.add_argument('--verbose', '-v', action='count', default=0)
+    parser.add_argument("--verbose", "-v", action="count", default=0)
     parser.add_argument("-q", "--queries", action="extend", nargs="+", type=str)
     parser.add_argument("--learning-rate", type=float, default=1)
     parser.add_argument("--max-iter", type=int, default=100)
@@ -353,7 +358,9 @@ if __name__ == "__main__":
             distance = Angular()
         else:
             raise ValueError("distance not given, and cannot be inferred from name")
-        logging.warning("distance not given, inferred from file name: %s", distance.name())
+        logging.warning(
+            "distance not given, inferred from file name: %s", distance.name()
+        )
     elif args.distance == "euclidean":
         distance = Euclidean()
     elif args.distance == "angular":
@@ -367,14 +374,10 @@ if __name__ == "__main__":
         n, rc = spec.split(":")
         n = int(n)
         rc = float(rc)
-        scores.extend([(rc/(1+delta), rc*(1+delta))] * n)
+        scores.extend([(rc / (1 + delta), rc * (1 + delta))] * n)
 
     hephaestus = HephaestusGradient(
-        distance,
-        relative_contrast,
-        args.learning_rate,
-        args.max_iter,
-        args.seed
+        distance, relative_contrast, args.learning_rate, args.max_iter, args.seed
     )
     with h5py.File(path) as hfp:
         data = jnp.array(hfp["train"][:])
@@ -393,5 +396,6 @@ if __name__ == "__main__":
         hfp["neighbors"] = idxs
         hfp["distances"] = dists
 
-    
 
+if __name__ == "__main__":
+    main()
