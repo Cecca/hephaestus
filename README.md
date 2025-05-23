@@ -42,9 +42,28 @@ Going back to the figure above you can see that the easiest query has a hardness
 
 ## How can I use it?
 
-The dependencies are managed using [`uv`](https://docs.astral.sh/uv/). Hence the simplest way to run the script is via the command:
+### As a CLI application
 
-    uv run python hephaestus.py
+To install `hephaestus` as a CLI application, simply run the following:
 
+    pip install git+https://github.com/cecca/hephaestus/
 
+Then, you can get some information about its options by running
+
+    hephaestus --help
+
+The program accepts HDF5 files as input (organized as in [ann-benchmarks](https://ann-benchmarks.com/index.html) and [VIBE](https://vector-index-bench.github.io/), that is we expect to have a `"train"` dataset in the file), and produces HDF5 files as output. To specify the number of queries to generate and the target relative contrast for them, you should use the `--queries` parameter, that should be followed by a string with the format `N:RC`, where `N` is the number of queries to generate, and `RC` is the target relative contrast. The `--queries parameter` can be issued multiple times.
+Therefore, the command 
+
+```
+hephaestus \
+    --dataset fashion-mnist-784-euclidean.hdf5 \
+    --output queries.hdf5 \
+    --queries 10:2.7 \
+    --queries 10:1.5 \
+    -k 10
+```
+
+generates a `queries.hdf5` file containing 20 queries: 10 having a relative contrast of about 2.7, and the other 10 with a relative contrast of about 1.5.
+For all queries, the relative contrast is computed with respect to $k=10$.
 
