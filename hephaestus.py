@@ -1,3 +1,4 @@
+import math
 import faiss
 from icecream import ic
 import numpy as np
@@ -30,6 +31,17 @@ class Euclidean(object):
     def from_euclidean(dists):
         return dists
 
+    @staticmethod
+    def random_neighbor(x, random_state, **kwargs):
+        """Returns a random neighbor of point x"""
+        scale = kwargs["scale"]
+        direction = jax.random.normal(random_state, x.shape)
+        direction /= jnp.linalg.norm(direction)
+        amount = scale*jax.random.exponential(random_state)
+        offset = direction * amount
+        neighbor = x + offset
+        return neighbor.astype(jnp.float32)
+
 
 class Angular(object):
     @staticmethod
@@ -56,6 +68,27 @@ class Angular(object):
     @staticmethod
     def from_euclidean(dists):
         return 1 - (2 - dists**2) / 2
+
+    @staticmethod
+    def random_neighbor(x, random_state, **kwargs):
+        """Returns a random neighbor of point x"""
+        scale = kwargs["scale"]
+        a = scale / (1-scale)
+        b = 1
+
+        # get orthogonal vector in a random direction
+        y = jax.random.normal(random_state, shape=x.shape)
+        y[0] = (0.0 - jnp.sum(x[1:] * y[1:])) / x[0]
+        y /= jnp.linalg.norm(y)
+        # get a random value for the dot product
+        d = 1 - jax.random.beta(random_state, a, b)
+        # compute the neighbor position
+        neighbor = x + y * jnp.tan(np.arccos(d))
+        neighbor /= jnp.linalg.norm(neighbor)
+        # check that the dot product is what we expect
+        d_check = jnp.dot(x, neighbor)
+        assert jnp.isclose(d, d_check)
+        return neighbor
 
 
 def relative_contrast(query, data, k, dist_fn):
@@ -250,7 +283,141 @@ class HNSWEmpiricalHardness(object):
             )
 
 
-class HephaestusGradient(object):
+class Generator(object):
+    def next_rand_state(self):
+        key, subkey = jax.random.split(self.random_state)
+        self.random_state = key
+        return subkey
+
+    def fit(self, data):
+        self.data = jnp.array(data)
+
+    def generate(self, k, score_low, score_high):
+        pass
+
+    def generate_many(self, k, scores):
+        from joblib import Parallel, delayed
+
+        def fn(i, score_pair):
+            for _ in range(i):
+                # make sure different iterations use a different random seed
+                self.next_rand_state()
+            q = self.generate(k, score_pair[0], score_pair[1])
+            rc = relative_contrast(q, self.data, k, self.distance)
+            lid = local_intrinsic_dimensionality(q, self.data, k, self.distance)
+            exp = query_expansion(q, self.data, k, self.distance)
+            dists = self.distance(q, self.data)
+            idxs = jnp.argsort(dists)
+            return q, rc, lid, exp, idxs[:k], dists[idxs[:k]]
+
+        res = Parallel(n_jobs=-1)(delayed(fn)(i, score_pair) for i, score_pair in enumerate(scores))
+        queries, rcs, lids, exps, idxs, dists = zip(*res)
+        return {
+            "test": jnp.stack(queries),
+            "relative_contrast": jnp.array(rcs),
+            "local_intrinsic_dimensionality": jnp.array(lids),
+            "query_expansion": jnp.array(exps),
+            "neighbors": jnp.stack(idxs),
+            "distances": jnp.stack(dists)
+        }
+    
+
+class HephaestusAnnealing(Generator):
+    def __init__(
+        self,
+        distance,
+        scorer,
+        initial_temperature=1.0,
+        max_iter=1000,
+        scale=0.1,
+        seed=1234,
+    ):
+        self.distance = distance
+        self.scorer = scorer
+        self.initial_temperature = initial_temperature
+        self.max_iter = max_iter
+        self.scale = scale
+        self.random_state = jax.random.key(seed)
+
+    def temperature(self, step):
+        # fast annealing schedule
+        return self.initial_temperature / (step + 1)
+
+    def generate(self, k, score_low, score_high):
+        x = self.data[
+            jax.random.randint(self.next_rand_state(), (1,), 0, self.data.shape[0])[0]
+        ]
+        x += jax.random.normal(self.next_rand_state(), (self.data.shape[1],)) * 0.001
+        x = self.distance.fixup_point(x)
+        y = self.scorer(x, self.data, k, self.distance)
+        x_best, y_best = x, y
+        logging.info("start from score %f", y)
+        if score_low <= y <= score_high:
+            logging.info("returning immediately")
+            return x
+
+        steps_since_last_improvement = 0
+        steps_threshold = max(self.max_iter // 100, 10)
+        logging.info("steps threshold %d", steps_threshold)
+
+        for step in range(self.max_iter):
+            if steps_since_last_improvement >= steps_threshold:
+                logging.info("moving back to the previous best due to lack of improvement")
+                x, y = x_best, y_best
+                steps_since_last_improvement = 0
+
+            x_next = self.distance.random_neighbor(x, self.next_rand_state(), scale=self.scale)
+            y_next = self.scorer(x_next, self.data, k, self.distance)
+            # FIXME: handle case of navigating towards easier points
+            if score_low <= y_next <= score_high:
+                logging.info(
+                    "Returning query point with score %f after %d iterations",
+                    y_next,
+                    step,
+                )
+                return x_next
+            elif min(abs(y_next - score_low), abs(y_next - score_high)) <= min(
+                abs(y - score_low), abs(y - score_high)
+            ):
+                # the next candidate goes towards the desired range
+                x, y = x_next, y_next
+                logging.info(
+                    "new best score %f, (still %f to go)",
+                    y,
+                    min(abs(y_next - score_low), abs(y_next - score_high)),
+                )
+                x_best, y_best = x, y
+                steps_since_last_improvement = 0
+            else:
+                # we pick the neighbor by the Metropolis criterion
+                delta = abs(y - y_next)
+                t = self.temperature(step)
+                p = math.exp(-delta / t)
+                if jax.random.bernoulli(self.next_rand_state(), p):
+                    x, y = x_next, y_next
+                    logging.info(
+                        "new score %f temperature %f (%d since last improvement, p=%f, delta=%f)",
+                        y,
+                        t,
+                        steps_since_last_improvement,
+                        p,
+                        delta,
+                    )
+                steps_since_last_improvement += 1
+            if step % 50 == 0:
+                logging.info(
+                    "%d/%d current score %f, (still %f to target)",
+                    step,
+                    self.max_iter,
+                    y,
+                    min(abs(y - score_low), abs(y - score_high)),
+                )
+
+        return x
+
+
+
+class HephaestusGradient(Generator):
     def __init__(
         self,
         distance,
@@ -265,31 +432,14 @@ class HephaestusGradient(object):
         self.max_iter = max_iter
         self.random_state = jax.random.key(seed)
 
-    def fit(self, data):
-        self.data = jnp.array(data)
-
-    def generate_many(self, k, scores):
-        from joblib import Parallel, delayed
-
-        def fn(score_pair):
-            q = self.generate(k, score_pair[0], score_pair[1])
-            rc = relative_contrast(q, self.data, k, self.distance)
-            dists = self.distance(q, self.data)
-            idxs = jnp.argsort(dists)
-            return q, rc, idxs[:k], dists[idxs[:k]]
-
-        res = Parallel(n_jobs=-1)(delayed(fn)(score_pair) for score_pair in scores)
-        queries, rcs, idxs, dists = zip(*res)
-        return jnp.stack(queries), jnp.array(rcs), jnp.stack(idxs), jnp.stack(dists)
-
     def generate(self, k, score_low, score_high):
         optimizer = optax.adam(self.learning_rate)
-        grad_fn = jax.value_and_grad(relative_contrast)
+        grad_fn = jax.value_and_grad(self.scorer)
 
         x = self.data[
-            jax.random.randint(self.random_state, (1,), 0, self.data.shape[0])[0]
+            jax.random.randint(self.next_rand_state(), (1,), 0, self.data.shape[0])[0]
         ]
-        x += jax.random.normal(self.random_state, (self.data.shape[1],)) * 0.001
+        x += jax.random.normal(self.next_rand_state(), (self.data.shape[1],)) * 0.001
         x = self.distance.fixup_point(x)
         opt_state = optimizer.init(x)
 
@@ -324,12 +474,15 @@ def main():
     parser = argparse.ArgumentParser("hephaestus")
     parser.add_argument("-d", "--dataset", type=pathlib.Path, required=True)
     parser.add_argument("-k", type=int, required=True)
-    parser.add_argument("--distance", type=str, required=False)
+    parser.add_argument("--distance", type=str, choices=["euclidean", "angular"], required=False)
+    parser.add_argument("--method", type=str, choices=["gradient", "annealing"], required=False, default="gradient")
     parser.add_argument("--delta", type=float, default=0.01)
     parser.add_argument("-o", "--output", type=pathlib.Path, required=False)
     parser.add_argument("--verbose", "-v", action="count", default=0)
     parser.add_argument("-q", "--queries", action="extend", nargs="+", type=str)
     parser.add_argument("--learning-rate", type=float, default=1)
+    parser.add_argument("--scale", type=float, default=1)
+    parser.add_argument("--initial-temperature", type=float, default=1)
     parser.add_argument("--max-iter", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1234)
 
@@ -376,25 +529,36 @@ def main():
         rc = float(rc)
         scores.extend([(rc / (1 + delta), rc * (1 + delta))] * n)
 
-    hephaestus = HephaestusGradient(
-        distance, relative_contrast, args.learning_rate, args.max_iter, args.seed
-    )
+    if args.method == "gradient":
+        logging.info("Using the gradient method")
+        generator = HephaestusGradient(
+            distance, relative_contrast, args.learning_rate, args.max_iter, args.seed
+        )
+    elif args.method == "annealing":
+        logging.info("Using the annealing method")
+        generator = HephaestusAnnealing(
+            distance, relative_contrast, initial_temperature=args.initial_temperature, max_iter=args.max_iter, scale=args.scale, seed=args.seed
+        )
+    else:
+        raise ValueError(f"unsupported method `{args.method}`")
+
     with h5py.File(path) as hfp:
         data = jnp.array(hfp["train"][:])
-    hephaestus.fit(data)
+    generator.fit(data)
 
-    queries, rcs, idxs, dists = hephaestus.generate_many(k, scores)
+    queries = generator.generate_many(k, scores)
 
     with h5py.File(output, "w") as hfp:
-        for key, value in vars(args).items():
+        metadata = vars(args)
+        del metadata["queries"]
+        for key, value in metadata.items():
             try:
                 hfp.attrs[key] = value
             except TypeError:
                 hfp.attrs[key] = str(value)
-        hfp["test"] = queries
-        hfp["relative_contrasts"] = rcs
-        hfp["neighbors"] = idxs
-        hfp["distances"] = dists
+        for key, data in queries.items():
+            ic(key, data)
+            hfp[key] = data
 
 
 if __name__ == "__main__":
