@@ -425,25 +425,33 @@ class HephaestusGradient(Generator):
         learning_rate=1.0,
         max_iter=1000,
         seed=1234,
+        trace=False,
     ):
         self.distance = distance
         self.scorer = scorer
         self.learning_rate = learning_rate
         self.max_iter = max_iter
         self.random_state = jax.random.key(seed)
+        if trace:
+            self.trace = []
 
-    def generate(self, k, score_low, score_high):
+    def generate(self, k, score_low, score_high, start=None):
         optimizer = optax.adam(self.learning_rate)
         grad_fn = jax.value_and_grad(self.scorer)
 
-        x = self.data[
-            jax.random.randint(self.next_rand_state(), (1,), 0, self.data.shape[0])[0]
-        ]
-        x += jax.random.normal(self.next_rand_state(), (self.data.shape[1],)) * 0.001
-        x = self.distance.fixup_point(x)
+        if start is None:
+            x = self.data[
+                jax.random.randint(self.next_rand_state(), (1,), 0, self.data.shape[0])[0]
+            ]
+            x += jax.random.normal(self.next_rand_state(), (self.data.shape[1],)) * 0.001
+            x = self.distance.fixup_point(x)
+        else:
+            x = self.distance.fixup_point(start)
         opt_state = optimizer.init(x)
 
         for i in range(self.max_iter):
+            if self.trace is not None:
+                self.trace.append(x)
             score, grads = grad_fn(x, self.data, k, self.distance)
             logging.info("iteration %d score=%f", i, score)
             assert jnp.isfinite(score)
