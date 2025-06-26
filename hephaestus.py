@@ -434,6 +434,8 @@ class HephaestusGradient(Generator):
         self.random_state = jax.random.key(seed)
         if trace:
             self.trace = []
+        else:
+            self.trace = None
 
     def generate(self, k, score_low, score_high, start=None):
         optimizer = optax.adam(self.learning_rate)
