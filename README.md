@@ -1,4 +1,7 @@
-# Hephaestus
+<div align="center">
+    <img width="180px" src="https://github.com/Cecca/hephaestus/blob/main/imgs/logo.svg"/>
+    <h1>Hephaestus</h1>
+</div>
 
 Like the Greek god of artisans and blacksmiths forged the weapons of gods,
 this software forges workloads for approximate nearest neighbor search algorithms.
