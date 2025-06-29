@@ -37,7 +37,7 @@ class Euclidean(object):
         scale = kwargs["scale"]
         direction = jax.random.normal(random_state, x.shape)
         direction /= jnp.linalg.norm(direction)
-        amount = scale*jax.random.exponential(random_state)
+        amount = scale * jax.random.exponential(random_state)
         offset = direction * amount
         neighbor = x + offset
         return neighbor.astype(jnp.float32)
@@ -73,7 +73,7 @@ class Angular(object):
     def random_neighbor(x, random_state, **kwargs):
         """Returns a random neighbor of point x"""
         scale = kwargs["scale"]
-        a = scale / (1-scale)
+        a = scale / (1 - scale)
         b = 1
 
         # get orthogonal vector in a random direction
@@ -190,7 +190,7 @@ class IVFEmpiricalHardness(object):
         self.index.train(data)
         self.index.add(data)
 
-    def evaluate(self, query, k):
+    def __call__(self, query, k):
         ground_truth = jnp.sort(self.distance_fn(query, self.data))
         query = query.reshape(1, -1)
         if self.assert_normalized:
@@ -244,7 +244,7 @@ class HNSWEmpiricalHardness(object):
         self.index.add(data)
         self.data = data
 
-    def evaluate(self, query, k):
+    def __call__(self, query, k):
         """Evaluates the empirical difficulty of the given point `x` for the given `k`.
         Returns the number of distance computations, scaled by the number of datasets.
         """
@@ -310,7 +310,9 @@ class Generator(object):
             idxs = jnp.argsort(dists)
             return q, rc, lid, exp, idxs[:k], dists[idxs[:k]]
 
-        res = Parallel(n_jobs=-1)(delayed(fn)(i, score_pair) for i, score_pair in enumerate(scores))
+        res = Parallel(backend="threading", n_jobs=-1)(
+            delayed(fn)(i, score_pair) for i, score_pair in enumerate(scores)
+        )
         queries, rcs, lids, exps, idxs, dists = zip(*res)
         return {
             "test": jnp.stack(queries),
@@ -318,9 +320,9 @@ class Generator(object):
             "local_intrinsic_dimensionality": jnp.array(lids),
             "query_expansion": jnp.array(exps),
             "neighbors": jnp.stack(idxs),
-            "distances": jnp.stack(dists)
+            "distances": jnp.stack(dists),
         }
-    
+
 
 class HephaestusAnnealing(Generator):
     def __init__(
@@ -362,11 +364,15 @@ class HephaestusAnnealing(Generator):
 
         for step in range(self.max_iter):
             if steps_since_last_improvement >= steps_threshold:
-                logging.info("moving back to the previous best due to lack of improvement")
+                logging.info(
+                    "moving back to the previous best due to lack of improvement"
+                )
                 x, y = x_best, y_best
                 steps_since_last_improvement = 0
 
-            x_next = self.distance.random_neighbor(x, self.next_rand_state(), scale=self.scale)
+            x_next = self.distance.random_neighbor(
+                x, self.next_rand_state(), scale=self.scale
+            )
             y_next = self.scorer(x_next, self.data, k, self.distance)
             # FIXME: handle case of navigating towards easier points
             if score_low <= y_next <= score_high:
@@ -416,12 +422,11 @@ class HephaestusAnnealing(Generator):
         return x
 
 
-
 class HephaestusGradient(Generator):
     def __init__(
         self,
         distance,
-        scorer,
+        scorer=relative_contrast,
         learning_rate=1.0,
         max_iter=1000,
         seed=1234,
@@ -439,13 +444,19 @@ class HephaestusGradient(Generator):
 
     def generate(self, k, score_low, score_high, start=None):
         optimizer = optax.adam(self.learning_rate)
-        grad_fn = jax.value_and_grad(self.scorer)
+        # NOTE: we always use the relative contrast to guide the exploration
+        # of the space. Then we might use a different scorer to decide if we are done.
+        grad_fn = jax.value_and_grad(relative_contrast)
 
         if start is None:
             x = self.data[
-                jax.random.randint(self.next_rand_state(), (1,), 0, self.data.shape[0])[0]
+                jax.random.randint(self.next_rand_state(), (1,), 0, self.data.shape[0])[
+                    0
+                ]
             ]
-            x += jax.random.normal(self.next_rand_state(), (self.data.shape[1],)) * 0.001
+            x += (
+                jax.random.normal(self.next_rand_state(), (self.data.shape[1],)) * 0.001
+            )
             x = self.distance.fixup_point(x)
         else:
             x = self.distance.fixup_point(start)
@@ -454,18 +465,27 @@ class HephaestusGradient(Generator):
         for i in range(self.max_iter):
             if self.trace is not None:
                 self.trace.append(x)
-            score, grads = grad_fn(x, self.data, k, self.distance)
-            logging.info("iteration %d score=%f", i, score)
-            assert jnp.isfinite(score)
-
-            if score_low <= score <= score_high:
-                break
+            rc, grads = grad_fn(x, self.data, k, self.distance)
+            logging.info("iteration %d rc=%f", i, rc)
+            assert jnp.isfinite(rc)
 
             grads = self.distance.fixup_gradient(grads, x)
 
-            if score < score_low:
-                # If we are too low, go the other way around
-                grads = -grads
+            if self.scorer != relative_contrast:
+                # Compute the score and decide if we are done
+                score = self.scorer(x, k)
+                logging.info("score: %f", score)
+                if score_low <= score <= score_high:
+                    break
+                if score > score_high:
+                    # If we are too difficult, go the other way around
+                    grads = -grads
+            else:
+                if score_low <= rc <= score_high:
+                    break
+                if rc < score_low:
+                    # If we are too difficult, go the other way around
+                    grads = -grads
 
             updates, opt_state = optimizer.update(grads, opt_state)
             x = optax.apply_updates(x, updates)
@@ -476,6 +496,34 @@ class HephaestusGradient(Generator):
         return x
 
 
+def setup_scorer(s, data, distance_fn):
+    """Instantiate the scoring function based on the
+    string received from the command line."""
+    import re
+
+    if s == "relative_contrast" or s == "rc":
+        return relative_contrast
+    hnsw_match = re.match(r"(HNSW\d+)@(0?\.\d+)", s)
+    if hnsw_match is not None:
+        index_params = hnsw_match.group(1)
+        recall = float(hnsw_match.group(2))
+        logging.info("Setting up HNSW index with params %s and recall %f", index_params, recall)
+        emp = HNSWEmpiricalHardness(distance_fn, recall, index_params)
+        logging.info("Fitting data")
+        emp.fit(data)
+        return emp
+    ivf_match = re.match(r"IVF@(0?\.\d+)", s)
+    if ivf_match is not None:
+        recall = float(ivf_match.group(1))
+        logging.info("Setting up IVF index with recall %f", recall)
+        emp = IVFEmpiricalHardness(distance_fn, recall)
+        logging.info("Fitting data")
+        emp.fit(data)
+        return emp
+    raise ValueError(f"could not parse `{s}` as a scoring function")
+    
+
+
 def main():
     import h5py
     import argparse
@@ -484,12 +532,21 @@ def main():
     parser = argparse.ArgumentParser("hephaestus")
     parser.add_argument("-d", "--dataset", type=pathlib.Path, required=True)
     parser.add_argument("-k", type=int, required=True)
-    parser.add_argument("--distance", type=str, choices=["euclidean", "angular"], required=False)
-    parser.add_argument("--method", type=str, choices=["gradient", "annealing"], required=False, default="gradient")
+    parser.add_argument(
+        "--distance", type=str, choices=["euclidean", "angular"], required=False
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["gradient", "annealing"],
+        required=False,
+        default="gradient",
+    )
     parser.add_argument("--delta", type=float, default=0.01)
     parser.add_argument("-o", "--output", type=pathlib.Path, required=False)
     parser.add_argument("--verbose", "-v", action="count", default=0)
     parser.add_argument("-q", "--queries", action="extend", nargs="+", type=str)
+    parser.add_argument("--scorer", type=str, default="relative_contrast")
     parser.add_argument("--learning-rate", type=float, default=1)
     parser.add_argument("--scale", type=float, default=1)
     parser.add_argument("--initial-temperature", type=float, default=1)
@@ -539,21 +596,33 @@ def main():
         rc = float(rc)
         scores.extend([(rc / (1 + delta), rc * (1 + delta))] * n)
 
+    with h5py.File(path) as hfp:
+        data = jnp.array(hfp["train"][:])
+
+    scorer = setup_scorer(args.scorer, data, distance)
+
     if args.method == "gradient":
         logging.info("Using the gradient method")
         generator = HephaestusGradient(
-            distance, relative_contrast, args.learning_rate, args.max_iter, args.seed
+            distance,
+            scorer,
+            learning_rate=args.learning_rate,
+            max_iter=args.max_iter,
+            seed=args.seed,
         )
     elif args.method == "annealing":
         logging.info("Using the annealing method")
         generator = HephaestusAnnealing(
-            distance, relative_contrast, initial_temperature=args.initial_temperature, max_iter=args.max_iter, scale=args.scale, seed=args.seed
+            distance,
+            scorer,
+            initial_temperature=args.initial_temperature,
+            max_iter=args.max_iter,
+            scale=args.scale,
+            seed=args.seed,
         )
     else:
         raise ValueError(f"unsupported method `{args.method}`")
 
-    with h5py.File(path) as hfp:
-        data = jnp.array(hfp["train"][:])
     generator.fit(data)
 
     queries = generator.generate_many(k, scores)
@@ -567,7 +636,6 @@ def main():
             except TypeError:
                 hfp.attrs[key] = str(value)
         for key, data in queries.items():
-            ic(key, data)
             hfp[key] = data
 
 

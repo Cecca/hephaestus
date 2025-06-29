@@ -55,8 +55,8 @@ for i, target in enumerate(targets):
     # measure difficulties
     rc = relative_contrast(q, data, k, distance)
     lid = local_intrinsic_dimensionality(q, data, k, distance)
-    emp_ivf = empirical_ivf.evaluate(q, k) * 100
-    emp_hnsw = empirical_hnsw.evaluate(q, k) * 100
+    emp_ivf = empirical_ivf(q, k) * 100
+    emp_hnsw = empirical_hnsw(q, k) * 100
 
     # get the kth nearest neighbor
     neighbors_idxs = jnp.argpartition(distance(q, data), k)[:k]
