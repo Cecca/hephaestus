@@ -190,8 +190,9 @@ class IVFEmpiricalHardness(object):
         self.index.train(data)
         self.index.add(data)
 
-    def __call__(self, query, k):
-        ground_truth = jnp.sort(self.distance_fn(query, self.data))
+    def __call__(self, query, k, ground_truth=None):
+        if ground_truth is None:
+            ground_truth = jnp.sort(self.distance_fn(query, self.data))
         query = query.reshape(1, -1)
         if self.assert_normalized:
             assert jnp.allclose(1.0, jnp.linalg.norm(query, axis=1)), (
@@ -244,11 +245,12 @@ class HNSWEmpiricalHardness(object):
         self.index.add(data)
         self.data = data
 
-    def __call__(self, query, k):
+    def __call__(self, query, k, ground_truth=None):
         """Evaluates the empirical difficulty of the given point `x` for the given `k`.
         Returns the number of distance computations, scaled by the number of datasets.
         """
-        ground_truth = jnp.sort(self.distance_fn(query, self.data))
+        if ground_truth is None:
+            ground_truth = jnp.sort(self.distance_fn(query, self.data))
         query = query.reshape(1, -1)
         if self.assert_normalized:
             assert jnp.allclose(1.0, jnp.linalg.norm(query, axis=1)), (
